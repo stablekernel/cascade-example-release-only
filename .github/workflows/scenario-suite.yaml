@@ -1,0 +1,358 @@
+name: Scenario Suite
+
+# Bespoke end-to-end validation driver for the release-only example.
+# It exercises the full lifecycle against the real repository: reset to a
+# clean slate, fire orchestrate by committing under src/, assert the RC
+# draft/prerelease is minted, dispatch promote to publish, then assert the
+# published release and tag cleanup. This file is hand-written and is not
+# part of the workflow set that cascade produces.
+
+on:
+  workflow_dispatch:
+    inputs:
+      orchestrate_timeout_minutes:
+        description: 'Max minutes to wait for the orchestrate run to mint an RC'
+        type: string
+        default: '8'
+      promote_timeout_minutes:
+        description: 'Max minutes to wait for the promote run to publish'
+        type: string
+        default: '8'
+  schedule:
+    # Daily smoke run at 06:30 UTC.
+    - cron: '30 6 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: scenario-suite
+  cancel-in-progress: false
+
+jobs:
+  scenario:
+    name: Release lifecycle scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MANIFEST_FILE: .github/manifest.yaml
+      MANIFEST_KEY: ci
+      TAG_PREFIX: rel-
+      BOT_NAME: 'github-actions[bot]'
+      BOT_EMAIL: 'github-actions[bot]@users.noreply.github.com'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+
+      - name: Setup CLI
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v0.1.0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+
+      # ------------------------------------------------------------------
+      # Stage 0 - RESET: wipe every release, tag, and state entry so the run
+      # always starts from a clean slate.
+      # ------------------------------------------------------------------
+      - name: Reset to clean slate
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Resetting releases, tags, and manifest state..."
+          cascade reset --state --push
+          # Re-sync the local checkout to whatever reset pushed to trunk.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+          echo "Reset complete."
+
+      # ------------------------------------------------------------------
+      # Stage 1 - FIRE ORCHESTRATE: commit a unique change under src/ to
+      # trunk. This matches triggers: [src/**] and starts the orchestrate
+      # workflow, which mints the RC draft and writes prerelease state.
+      # ------------------------------------------------------------------
+      - name: Commit a src change to fire orchestrate
+        id: fire
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          STAMP="$(date -u +%Y%m%d%H%M%S)-${GITHUB_RUN_ID}"
+          printf 'scenario run %s\n' "$STAMP" > src/x
+          git add src/x
+          git commit -S -m "feat: exercise release orchestration ${STAMP}" || \
+            git commit -m "feat: exercise release orchestration ${STAMP}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          PUSHED_SHA="$(git rev-parse HEAD)"
+          echo "pushed_sha=${PUSHED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${PUSHED_SHA} to ${GITHUB_REF_NAME}."
+
+      - name: Wait for orchestrate run to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WAIT_MINUTES: ${{ github.event.inputs.orchestrate_timeout_minutes || '8' }}
+        run: |
+          set -euo pipefail
+          # Bounded poll: orchestrate is triggered by the push above. Wait for
+          # the most recent orchestrate.yaml run to finish successfully.
+          MAX_ATTEMPTS=$(( WAIT_MINUTES * 4 ))   # one attempt every 15s
+          attempt=0
+          status=""
+          conclusion=""
+          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+            attempt=$(( attempt + 1 ))
+            LINE="$(gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow orchestrate.yaml \
+              --branch "${GITHUB_REF_NAME}" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)"
+            status="${LINE%% *}"
+            conclusion="${LINE##* }"
+            echo "attempt ${attempt}/${MAX_ATTEMPTS}: status='${status}' conclusion='${conclusion}'"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Orchestrate run completed successfully."
+                exit 0
+              fi
+              echo "::error::Orchestrate run completed with conclusion '${conclusion}' (expected success)."
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for the orchestrate run to complete."
+          exit 1
+
+      # ------------------------------------------------------------------
+      # Stage 1 assertions: an RC draft/prerelease exists, a matching rel-*-rc.*
+      # tag exists, and manifest prerelease state is populated.
+      # ------------------------------------------------------------------
+      - name: Assert RC draft minted
+        id: stage1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Pull the latest trunk so we read the state the orchestrate run wrote.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+
+          # 1) A GitHub release tagged rel-*-rc.* that is a draft or prerelease.
+          RC_RELEASE=""
+          for attempt in 1 2 3 4 5 6 7 8; do
+            RC_RELEASE="$(gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 50 \
+              --json tagName,isDraft,isPrerelease \
+              --jq "[.[] | select(.tagName | test(\"^${TAG_PREFIX}.*-rc\\\\.\")) | select(.isDraft or .isPrerelease)] | .[0].tagName // \"\"" 2>/dev/null || true)"
+            if [ -n "$RC_RELEASE" ]; then
+              break
+            fi
+            echo "RC release not visible yet (attempt ${attempt}); waiting..."
+            sleep 10
+          done
+          if [ -z "$RC_RELEASE" ]; then
+            echo "::error::No draft/prerelease release tagged ${TAG_PREFIX}*-rc.* was found."
+            gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 || true
+            exit 1
+          fi
+          echo "Observed RC release: ${RC_RELEASE}"
+          echo "rc_tag=${RC_RELEASE}" >> "$GITHUB_OUTPUT"
+
+          # 2) A matching rel-*-rc.* git tag exists on the remote.
+          RC_GIT_TAG="$(git ls-remote --tags origin \
+            | sed -n 's@.*refs/tags/@@p' \
+            | grep -E "^${TAG_PREFIX}.*-rc\." \
+            | grep -v '\^{}$' \
+            | head -n1 || true)"
+          if [ -z "$RC_GIT_TAG" ]; then
+            echo "::error::No remote git tag matching ${TAG_PREFIX}*-rc.* was found."
+            exit 1
+          fi
+          echo "Observed RC git tag: ${RC_GIT_TAG}"
+
+          # 3) Manifest prerelease state is populated.
+          STATE_VERSION="$(yq eval ".${MANIFEST_KEY}.state.prerelease.version // \"\"" "$MANIFEST_FILE")"
+          STATE_BY="$(yq eval ".${MANIFEST_KEY}.state.prerelease.committed_by // \"\"" "$MANIFEST_FILE")"
+          if [ -z "$STATE_VERSION" ] || [ "$STATE_VERSION" = "null" ]; then
+            echo "::error::ci.state.prerelease.version is empty after orchestrate."
+            exit 1
+          fi
+          if [ -z "$STATE_BY" ] || [ "$STATE_BY" = "null" ]; then
+            echo "::error::ci.state.prerelease.committed_by is empty after orchestrate."
+            exit 1
+          fi
+          echo "Observed prerelease state: version=${STATE_VERSION} committed_by=${STATE_BY}"
+
+          {
+            echo "stage1_release=${RC_RELEASE}"
+            echo "stage1_tag=${RC_GIT_TAG}"
+            echo "stage1_version=${STATE_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Stage 1 PASS: RC draft '${RC_RELEASE}' minted, tag '${RC_GIT_TAG}' present, state version '${STATE_VERSION}'."
+
+      # ------------------------------------------------------------------
+      # Stage 2 - PROMOTE: dispatch promote.yaml to publish the prerelease
+      # into a published, latest release and clean up the RC tag(s).
+      # ------------------------------------------------------------------
+      - name: Dispatch promote workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching promote.yaml (mode=default, dry_run=false)..."
+          gh workflow run promote.yaml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f mode=default \
+            -f dry_run=false
+          # Give GitHub a moment to register the dispatched run.
+          sleep 10
+
+      - name: Wait for promote run to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WAIT_MINUTES: ${{ github.event.inputs.promote_timeout_minutes || '8' }}
+        run: |
+          set -euo pipefail
+          MAX_ATTEMPTS=$(( WAIT_MINUTES * 4 ))
+          attempt=0
+          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+            attempt=$(( attempt + 1 ))
+            LINE="$(gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow promote.yaml \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)"
+            status="${LINE%% *}"
+            conclusion="${LINE##* }"
+            echo "attempt ${attempt}/${MAX_ATTEMPTS}: status='${status}' conclusion='${conclusion}'"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Promote run completed successfully."
+                exit 0
+              fi
+              echo "::error::Promote run completed with conclusion '${conclusion}' (expected success)."
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for the promote run to complete."
+          exit 1
+
+      # ------------------------------------------------------------------
+      # Stage 2 assertions: a published latest release tagged rel-<semver>
+      # (no -rc.) exists, the RC tag(s) are deleted, and the body has a
+      # Contributors section.
+      # ------------------------------------------------------------------
+      - name: Assert published release
+        id: stage2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1) A published (not draft, not prerelease) release tagged
+          #    rel-<semver> with no -rc. segment, marked latest.
+          PUB_TAG=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            PUB_TAG="$(gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 50 \
+              --json tagName,isDraft,isPrerelease,isLatest \
+              --jq "[.[] | select(.tagName | test(\"^${TAG_PREFIX}\")) | select((.tagName | test(\"-rc\\\\.\")) | not) | select((.isDraft or .isPrerelease) | not)] | .[0].tagName // \"\"" 2>/dev/null || true)"
+            if [ -n "$PUB_TAG" ]; then
+              break
+            fi
+            echo "Published release not visible yet (attempt ${attempt}); waiting..."
+            sleep 10
+          done
+          if [ -z "$PUB_TAG" ]; then
+            echo "::error::No published (non-draft, non-prerelease) release tagged ${TAG_PREFIX}<semver> was found."
+            gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 || true
+            exit 1
+          fi
+          echo "Observed published release: ${PUB_TAG}"
+
+          # Confirm it is flagged latest.
+          IS_LATEST="$(gh release list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --limit 50 \
+            --json tagName,isLatest \
+            --jq "[.[] | select(.tagName == \"${PUB_TAG}\")] | .[0].isLatest // false")"
+          if [ "$IS_LATEST" != "true" ]; then
+            echo "::error::Published release ${PUB_TAG} is not marked latest."
+            exit 1
+          fi
+
+          # 2) The published semver git tag exists and the RC tag(s) are gone.
+          git fetch --prune --tags origin
+          REMOTE_TAGS="$(git ls-remote --tags origin \
+            | sed -n 's@.*refs/tags/@@p' \
+            | grep -v '\^{}$' || true)"
+          if ! printf '%s\n' "$REMOTE_TAGS" | grep -qx "$PUB_TAG"; then
+            echo "::error::Published semver tag ${PUB_TAG} is not present on the remote."
+            exit 1
+          fi
+          LEFTOVER_RC="$(printf '%s\n' "$REMOTE_TAGS" | grep -E "^${TAG_PREFIX}.*-rc\." || true)"
+          if [ -n "$LEFTOVER_RC" ]; then
+            echo "::error::RC tag(s) were not cleaned up after publish: ${LEFTOVER_RC}"
+            exit 1
+          fi
+          echo "RC tags cleaned up; published tag ${PUB_TAG} present."
+
+          # 3) The release body carries a Contributors section.
+          BODY="$(gh release view "$PUB_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json body \
+            --jq '.body // ""')"
+          if ! printf '%s\n' "$BODY" | grep -qi 'Contributors'; then
+            echo "::error::Published release body does not contain a Contributors section."
+            exit 1
+          fi
+          echo "Contributors section present in release body."
+
+          {
+            echo "stage2_release=${PUB_TAG}"
+            echo "stage2_tag=${PUB_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Stage 2 PASS: published release '${PUB_TAG}' is latest, RC tags cleaned, Contributors present."
+
+      - name: Write run summary
+        if: always()
+        env:
+          STAGE1_RELEASE: ${{ steps.stage1.outputs.stage1_release }}
+          STAGE1_TAG: ${{ steps.stage1.outputs.stage1_tag }}
+          STAGE1_VERSION: ${{ steps.stage1.outputs.stage1_version }}
+          STAGE2_RELEASE: ${{ steps.stage2.outputs.stage2_release }}
+          STAGE2_TAG: ${{ steps.stage2.outputs.stage2_tag }}
+        run: |
+          {
+            echo "## Scenario Suite"
+            echo ""
+            echo "| Stage | Release stage | GitHub release | Tag |"
+            echo "|-------|---------------|----------------|-----|"
+            echo "| 1 | RC draft / prerelease | ${STAGE1_RELEASE:-n/a} | ${STAGE1_TAG:-n/a} |"
+            echo "| 2 | Published (latest) | ${STAGE2_RELEASE:-n/a} | ${STAGE2_TAG:-n/a} |"
+            echo ""
+            if [ -n "${STAGE2_RELEASE:-}" ]; then
+              echo "**Overall: PASS** - prerelease ${STAGE1_VERSION:-?} published as ${STAGE2_RELEASE}."
+            else
+              echo "**Overall: see step logs for the failing assertion.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
