@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+          token: ${{ secrets.CASCADE_STATE_TEST_TOKEN }}
 
       - name: Setup CLI
         uses: stablekernel/cascade/.github/actions/setup-cli@v0.1.0
@@ -65,7 +65,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Reset to clean slate
         env:
-          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TEST_TOKEN }}
         run: |
           set -euo pipefail
           echo "Resetting releases, tags, and manifest state..."
@@ -83,7 +83,7 @@ jobs:
       - name: Commit a src change to fire orchestrate
         id: fire
         env:
-          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TEST_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p src
