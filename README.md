@@ -57,5 +57,5 @@ state, dispatches promote, then asserts a published `rel-<semver>` release that
 is marked latest, with the candidate tags cleaned up and a Contributors section
 in the body.
 
-It runs on a daily schedule and on manual dispatch. It needs a `CASCADE_STATE_TOKEN`
+It runs on a daily schedule and on manual dispatch. It needs a `CASCADE_STATE_TEST_TOKEN`
 repository secret with permission to push to trunk and manage releases.
