@@ -1,0 +1,17 @@
+ci:
+  config:
+    schema_version: 1
+    trunk_branch: main
+    cli_version: v0.1.0
+    state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
+    manifest_file: .github/manifest.yaml
+    manifest_key: ci
+    tag_prefix: rel-
+    triggers: [src/**]
+    builds:
+      - name: lib
+        workflow: .github/workflows/build-lib.yaml
+        triggers: []
+    changelog:
+      contributors: true
+  state: {}
