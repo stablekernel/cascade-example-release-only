@@ -302,8 +302,9 @@ jobs:
 
       # ------------------------------------------------------------------
       # Stage 2 assertions: a published latest release tagged rel-<semver>
-      # (no -rc.) exists, the RC tag(s) are deleted, and the body has a
-      # Contributors section.
+      # (no -rc.) exists, the RC tag(s) are deleted, and the body carries
+      # inline contributor attribution (the (@username) form produced by
+      # changelog.contributors: true).
       # ------------------------------------------------------------------
       - name: Assert published release
         id: stage2
@@ -361,23 +362,27 @@ jobs:
           fi
           echo "RC tags cleaned up; published tag ${PUB_TAG} present."
 
-          # 3) The release body carries a Contributors section.
+          # 3) The release body carries inline contributor attribution. With
+          #    changelog.contributors: true, cascade appends a "(@username)"
+          #    suffix to each changelog entry; it does NOT emit a separate
+          #    "Contributors" heading. Assert the inline (@username) form.
           BODY="$(gh release view "$PUB_TAG" \
             --repo "${GITHUB_REPOSITORY}" \
             --json body \
             --jq '.body // ""')"
-          if ! printf '%s\n' "$BODY" | grep -qi 'Contributors'; then
-            echo "::error::Published release body does not contain a Contributors section."
+          if ! printf '%s\n' "$BODY" | grep -qE '\(@[A-Za-z0-9-]+\)'; then
+            echo "::error::Published release body lacks inline (@username) contributor attribution."
+            printf '%s\n' "$BODY"
             exit 1
           fi
-          echo "Contributors section present in release body."
+          echo "Inline contributor attribution present in release body."
 
           {
             echo "stage2_release=${PUB_TAG}"
             echo "stage2_tag=${PUB_TAG}"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Stage 2 PASS: published release '${PUB_TAG}' is latest, RC tags cleaned, Contributors present."
+          echo "Stage 2 PASS: published release '${PUB_TAG}' is latest, RC tags cleaned, inline attribution present."
 
       - name: Write run summary
         if: always()
