@@ -25,6 +25,7 @@ on:
 permissions:
   contents: write
   actions: write
+  pull-requests: write
 
 concurrency:
   group: scenario-suite
@@ -76,62 +77,103 @@ jobs:
           echo "Reset complete."
 
       # ------------------------------------------------------------------
-      # Stage 1 - FIRE ORCHESTRATE: commit a unique change under src/ to
-      # trunk. This matches triggers: [src/**] and starts the orchestrate
-      # workflow, which mints the RC draft and writes prerelease state.
+      # Stage 1 - FIRE ORCHESTRATE: open a PR with a src/ change, squash-merge
+      # it with the PAT so the merge commit carries a feat: subject, which
+      # matches the orchestrate path filter and triggers a version bump.
       # ------------------------------------------------------------------
-      - name: Commit a src change to fire orchestrate
+      - name: Open and merge src-change PR to fire orchestrate
         id: fire
         env:
           GH_TOKEN: ${{ secrets.CASCADE_STATE_TEST_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p src
+          git config user.name  "scenario-suite"
+          git config user.email "scenario-suite@users.noreply.github.com"
+
+          # Unique branch so re-runs never collide.
           STAMP="$(date -u +%Y%m%d%H%M%S)-${GITHUB_RUN_ID}"
-          printf 'scenario run %s\n' "$STAMP" > src/x
-          git add src/x
-          git commit -S -m "feat: exercise release orchestration ${STAMP}" || \
-            git commit -m "feat: exercise release orchestration ${STAMP}"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
-          PUSHED_SHA="$(git rev-parse HEAD)"
-          echo "pushed_sha=${PUSHED_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Pushed ${PUSHED_SHA} to ${GITHUB_REF_NAME}."
+          BRANCH="scenario/src-${STAMP}"
+          git fetch origin main --quiet
+          git checkout -B "$BRANCH" origin/main
+
+          # Write under src/ to match the orchestrate path filter.
+          mkdir -p src
+          printf 'scenario run %s\n' "$STAMP" > src/scenario.txt
+          git add src/scenario.txt
+
+          # Branch commit message is cosmetic under squash; PR title carries
+          # the conventional type and becomes the trunk commit subject.
+          git commit -m "feat: exercise release orchestration ${STAMP}"
+          git push origin "$BRANCH"
+
+          # Open PR and squash-merge with the PAT so the push event is
+          # PAT-authored and orchestrate fires.
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "feat: exercise release orchestration ${STAMP}" \
+            --body "Automated scenario run; drives orchestrate on merge."
+          gh pr merge "$BRANCH" --squash --delete-branch
+
+          # Capture the exact merge SHA on trunk - used to key the wait loop.
+          git fetch origin main --quiet
+          MERGE_SHA="$(git rev-parse origin/main)"
+          echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Squash-merged ${BRANCH} -> main at ${MERGE_SHA}."
 
       - name: Wait for orchestrate run to complete
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TEST_TOKEN }}
           WAIT_MINUTES: ${{ github.event.inputs.orchestrate_timeout_minutes || '8' }}
         run: |
           set -euo pipefail
-          # Bounded poll: orchestrate is triggered by the push above. Wait for
-          # the most recent orchestrate.yaml run to finish successfully.
+          MERGE_SHA="${{ steps.fire.outputs.merge_sha }}"
           MAX_ATTEMPTS=$(( WAIT_MINUTES * 4 ))   # one attempt every 15s
-          attempt=0
-          status=""
-          conclusion=""
-          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
-            attempt=$(( attempt + 1 ))
-            LINE="$(gh run list \
+
+          # Locate the orchestrate run triggered by this exact merge commit.
+          RUN_ID=""
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            RUN_ID="$(gh run list \
               --repo "${GITHUB_REPOSITORY}" \
               --workflow orchestrate.yaml \
-              --branch "${GITHUB_REF_NAME}" \
-              --limit 1 \
+              --branch main \
+              --json databaseId,headSha,status \
+              --jq ".[] | select(.headSha==\"${MERGE_SHA}\") | .databaseId" \
+              2>/dev/null | head -n1 || true)"
+            if [ -n "$RUN_ID" ]; then
+              echo "Found orchestrate run ${RUN_ID} for ${MERGE_SHA}."
+              break
+            fi
+            echo "attempt ${i}/${MAX_ATTEMPTS}: no orchestrate run for ${MERGE_SHA} yet; waiting..."
+            sleep 15
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No orchestrate run found for merge SHA ${MERGE_SHA} after ${WAIT_MINUTES}m."
+            exit 1
+          fi
+
+          # Poll the located run to completion.
+          attempt=0
+          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+            attempt=$(( attempt + 1 ))
+            LINE="$(gh run view "$RUN_ID" \
+              --repo "${GITHUB_REPOSITORY}" \
               --json status,conclusion \
-              --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)"
+              --jq '"\(.status) \(.conclusion)"' 2>/dev/null || true)"
             status="${LINE%% *}"
             conclusion="${LINE##* }"
-            echo "attempt ${attempt}/${MAX_ATTEMPTS}: status='${status}' conclusion='${conclusion}'"
+            echo "poll ${attempt}/${MAX_ATTEMPTS}: run ${RUN_ID} status='${status}' conclusion='${conclusion}'"
             if [ "$status" = "completed" ]; then
               if [ "$conclusion" = "success" ]; then
                 echo "Orchestrate run completed successfully."
                 exit 0
               fi
-              echo "::error::Orchestrate run completed with conclusion '${conclusion}' (expected success)."
+              echo "::error::Orchestrate run ${RUN_ID} completed with conclusion '${conclusion}' (expected success)."
               exit 1
             fi
             sleep 15
           done
-          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for the orchestrate run to complete."
+          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for orchestrate run ${RUN_ID} to complete."
           exit 1
 
       # ------------------------------------------------------------------
