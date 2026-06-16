@@ -14,4 +14,9 @@ ci:
         triggers: []
     changelog:
       contributors: true
-  state: {}
+  state:
+    prerelease:
+      sha: 4529b502553c8f9760715360f4e1a3a29ef45cce
+      version: rel-0.1.0-rc.0
+      committed_at: "2026-06-16T23:01:37Z"
+      committed_by: joshua-temple
