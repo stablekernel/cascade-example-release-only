@@ -255,18 +255,21 @@ jobs:
       # into a published, latest release and clean up the RC tag(s).
       # ------------------------------------------------------------------
       - name: Dispatch promote workflow
+        id: dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Dispatching promote.yaml (mode=default, dry_run=false)..."
+          # Capture the UTC instant immediately before dispatch so the wait step
+          # can select only the run this step triggered, never a prior promote.
+          DISPATCH_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "dispatch_ts=${DISPATCH_TS}" >> "$GITHUB_OUTPUT"
+          echo "Dispatching promote.yaml (mode=default, dry_run=false) at ${DISPATCH_TS}..."
           gh workflow run promote.yaml \
             --repo "${GITHUB_REPOSITORY}" \
             --ref "${GITHUB_REF_NAME}" \
             -f mode=default \
             -f dry_run=false
-          # Give GitHub a moment to register the dispatched run.
-          sleep 10
 
       - name: Wait for promote run to complete
         env:
@@ -274,30 +277,54 @@ jobs:
           WAIT_MINUTES: ${{ github.event.inputs.promote_timeout_minutes || '8' }}
         run: |
           set -euo pipefail
-          MAX_ATTEMPTS=$(( WAIT_MINUTES * 4 ))
+          DISPATCH_TS="${{ steps.dispatch.outputs.dispatch_ts }}"
+          MAX_ATTEMPTS=$(( WAIT_MINUTES * 4 ))   # one attempt every 15s
+
+          # Locate the promote run this suite dispatched: the first run created
+          # at or after the captured dispatch timestamp.
+          RUN_ID=""
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            RUN_ID="$(gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow promote.yaml \
+              --created ">=${DISPATCH_TS}" \
+              --json databaseId,status \
+              --jq '.[0].databaseId // empty' \
+              2>/dev/null || true)"
+            if [ -n "$RUN_ID" ]; then
+              echo "Found promote run ${RUN_ID} dispatched at ${DISPATCH_TS}."
+              break
+            fi
+            echo "attempt ${i}/${MAX_ATTEMPTS}: no promote run created since ${DISPATCH_TS} yet; waiting..."
+            sleep 15
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No promote run created at or after ${DISPATCH_TS} after ${WAIT_MINUTES}m."
+            exit 1
+          fi
+
+          # Poll the located run to completion.
           attempt=0
           while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
             attempt=$(( attempt + 1 ))
-            LINE="$(gh run list \
+            LINE="$(gh run view "$RUN_ID" \
               --repo "${GITHUB_REPOSITORY}" \
-              --workflow promote.yaml \
-              --limit 1 \
               --json status,conclusion \
-              --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)"
+              --jq '"\(.status) \(.conclusion)"' 2>/dev/null || true)"
             status="${LINE%% *}"
             conclusion="${LINE##* }"
-            echo "attempt ${attempt}/${MAX_ATTEMPTS}: status='${status}' conclusion='${conclusion}'"
+            echo "poll ${attempt}/${MAX_ATTEMPTS}: run ${RUN_ID} status='${status}' conclusion='${conclusion}'"
             if [ "$status" = "completed" ]; then
               if [ "$conclusion" = "success" ]; then
                 echo "Promote run completed successfully."
                 exit 0
               fi
-              echo "::error::Promote run completed with conclusion '${conclusion}' (expected success)."
+              echo "::error::Promote run ${RUN_ID} completed with conclusion '${conclusion}' (expected success)."
               exit 1
             fi
             sleep 15
           done
-          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for the promote run to complete."
+          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for promote run ${RUN_ID} to complete."
           exit 1
 
       # ------------------------------------------------------------------
