@@ -36,6 +36,12 @@ jobs:
     name: Release lifecycle scenario
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # Captured before anything is dispatched. The reconcile job enumerates
+      # every run this repo produced at or after this instant and fails if any
+      # is unaccounted for in the ledger. Recorded first so no run the suite
+      # causes can fall outside the window.
+      window-start: ${{ steps.window.outputs.window-start }}
     env:
       MANIFEST_FILE: .github/manifest.yaml
       MANIFEST_KEY: ci
@@ -43,6 +49,17 @@ jobs:
       BOT_NAME: 'github-actions[bot]'
       BOT_EMAIL: 'github-actions[bot]@users.noreply.github.com'
     steps:
+      # The reconcile window opens here, before the first dispatch or merge.
+      # Every run the suite goes on to cause lands at or after this timestamp,
+      # so the reconcile job sees all of them.
+      - name: Open reconcile window
+        id: window
+        run: |
+          set -euo pipefail
+          WINDOW_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "window-start=$WINDOW_START" >> "$GITHUB_OUTPUT"
+          echo "reconcile window opened at $WINDOW_START"
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -126,6 +143,7 @@ jobs:
           echo "Squash-merged ${BRANCH} -> main at ${MERGE_SHA}."
 
       - name: Wait for orchestrate run to complete
+        id: orchestrate_wait
         env:
           GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
           WAIT_MINUTES: ${{ github.event.inputs.orchestrate_timeout_minutes || '8' }}
@@ -156,6 +174,11 @@ jobs:
             exit 1
           fi
 
+          # Surface the resolved run id so the fleet reconcile gate can register
+          # it. Emitted as soon as it is known, before the poll below, so the
+          # ledger captures it even if the conclusion poll later fails it.
+          echo "orchestrate_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
           # Poll the located run to completion.
           attempt=0
           while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
@@ -179,6 +202,18 @@ jobs:
           done
           echo "::error::Timed out after ${WAIT_MINUTES}m waiting for orchestrate run ${RUN_ID} to complete."
           exit 1
+
+      # Register the orchestrate run in the fleet ledger so the reconcile gate
+      # accounts for it. Runs whenever the run id resolved, even if the wait
+      # step above failed it, so a registered run is never silently dropped.
+      - name: Register orchestrate run
+        if: always() && steps.orchestrate_wait.outputs.orchestrate_run_id != ''
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.orchestrate_wait.outputs.orchestrate_run_id }}
+          expected-conclusion: success
+          reason: orchestrate-merge
+          upload: 'true'
 
       # ------------------------------------------------------------------
       # Stage 1 assertions: an RC draft/prerelease exists, a matching rel-*-rc.*
@@ -272,6 +307,7 @@ jobs:
             -f dry_run=false
 
       - name: Wait for promote run to complete
+        id: promote_wait
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WAIT_MINUTES: ${{ github.event.inputs.promote_timeout_minutes || '8' }}
@@ -303,6 +339,10 @@ jobs:
             exit 1
           fi
 
+          # Surface the resolved run id for the fleet reconcile gate, before the
+          # conclusion poll so the ledger captures it regardless of outcome.
+          echo "promote_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
           # Poll the located run to completion.
           attempt=0
           while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
@@ -326,6 +366,18 @@ jobs:
           done
           echo "::error::Timed out after ${WAIT_MINUTES}m waiting for promote run ${RUN_ID} to complete."
           exit 1
+
+      # Register the promote run in the fleet ledger so the reconcile gate
+      # accounts for it. Runs whenever the run id resolved, even if the wait
+      # step above failed it.
+      - name: Register promote run
+        if: always() && steps.promote_wait.outputs.promote_run_id != ''
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.promote_wait.outputs.promote_run_id }}
+          expected-conclusion: success
+          reason: promote-publish
+          upload: 'true'
 
       # ------------------------------------------------------------------
       # Stage 2 assertions: a published latest release tagged rel-<semver>
@@ -434,3 +486,25 @@ jobs:
               echo "**Overall: see step logs for the failing assertion.**"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Reconcile gate: structural coverage backstop. The scenario job's own
+  # asserts above still gate each run they wait on; this job is additive. It
+  # enumerates EVERY run this repo produced since window-start (captured before
+  # the first merge) and fails if any is unaccounted for in the ledger the
+  # register-run steps uploaded - an unregistered non-success run, or a
+  # registered run that concluded other than its expected conclusion. That turns
+  # any fire-and-forget run the suite forgot to gate into a hard red.
+  reconcile:
+    name: Reconcile scenario-window runs
+    needs: [scenario]
+    if: always()
+    uses: stablekernel/cascade/.github/workflows/fleet-reconcile.yaml@main
+    permissions:
+      contents: read
+      actions: read
+    with:
+      window-start: ${{ needs.scenario.outputs.window-start }}
+      # Artifact mode: each register-run step uploaded a per-job ledger under
+      # the default cascade-run-ledger-* name; reconcile globs and merges them.
+      cascade-ref: main
