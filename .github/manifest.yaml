@@ -5,7 +5,6 @@ ci:
         triggers:
             - src/**
         cli_version: v0.7.0-rc.0
-        cli_version_sha: eb7414d2de8c30f8efe51752d082224fe8b6a5e3
         tag_prefix: rel-
         state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
         manifest_file: .github/manifest.yaml
@@ -16,14 +15,3 @@ ci:
               triggers: []
         changelog:
             contributors: true
-    state:
-        release:
-            sha: 828e9430c7c64054a0d0d5be0435bd395f4eb87d
-            version: rel-0.1.0
-            committed_at: "2026-06-30T07:50:54Z"
-            committed_by: github-actions[bot]
-    latest_release:
-        version: rel-0.1.0
-        sha: 828e9430c7c64054a0d0d5be0435bd395f4eb87d
-        released_on: "2026-06-30T07:50:54Z"
-        released_by: github-actions[bot]
