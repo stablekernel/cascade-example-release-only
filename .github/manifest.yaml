@@ -17,14 +17,3 @@ ci:
               triggers: []
         changelog:
             contributors: true
-    state:
-        release:
-            sha: 6bb53d6c5dc5bbe10e428196c8a24f8c70bab787
-            version: rel-0.1.0
-            committed_at: "2026-09-04T06:51:49Z"
-            committed_by: github-actions[bot]
-    latest_release:
-        version: rel-0.1.0
-        sha: 6bb53d6c5dc5bbe10e428196c8a24f8c70bab787
-        released_on: "2026-09-04T06:51:49Z"
-        released_by: github-actions[bot]
