@@ -1,25 +1,30 @@
 ci:
-  config:
-    schema_version: 1
-    trunk_branch: main
-    triggers:
-      - src/**
-    cli_version: v1.1.3-rc.2
-    cli_version_sha: 0ded3b4a8e8f5b895e7610465a671e861abfe70d
-    tag_grammar:
-      prefix: rel-
-    state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
-    manifest_file: .github/manifest.yaml
-    manifest_key: ci
-    builds:
-      - name: lib
-        workflow: .github/workflows/build-lib.yaml
-        triggers: []
-    changelog:
-      contributors: true
-  state:
-    prerelease:
-      sha: bd7b97f937ed3ed884c53e302ca7121844265371
-      version: rel-0.1.0-rc.0
-      committed_at: "2026-11-23T06:50:48Z"
-      committed_by: joshua-temple
+    config:
+        schema_version: 1
+        trunk_branch: main
+        triggers:
+            - src/**
+        cli_version: v1.1.3-rc.2
+        cli_version_sha: 0ded3b4a8e8f5b895e7610465a671e861abfe70d
+        tag_grammar:
+            prefix: rel-
+        state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
+        manifest_file: .github/manifest.yaml
+        manifest_key: ci
+        builds:
+            - name: lib
+              workflow: .github/workflows/build-lib.yaml
+              triggers: []
+        changelog:
+            contributors: true
+    state:
+        release:
+            sha: bd7b97f937ed3ed884c53e302ca7121844265371
+            version: rel-0.1.0
+            committed_at: "2026-11-23T06:51:47Z"
+            committed_by: github-actions[bot]
+    latest_release:
+        version: rel-0.1.0
+        sha: bd7b97f937ed3ed884c53e302ca7121844265371
+        released_on: "2026-11-23T06:51:47Z"
+        released_by: github-actions[bot]
